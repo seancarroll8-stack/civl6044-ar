@@ -1,4 +1,6 @@
-// CIVL6044 AR Prototype 1 - application controller.
+// CIVL6044 AR Prototype 1.1 - application controller.
+// Three views share one state: AR camera (3D model on the printed sheet),
+// 3D model (no camera, virtual sheet) and 2D sheet (flat drawing, no 3D libraries).
 import { G } from "./geometry.js";
 import { solve, snapLoad, fmt } from "./beam.js";
 import { createOverlayCanvas, drawOverlay, inDragBand, mOf } from "./overlay.js";
@@ -6,11 +8,16 @@ import { createOverlayCanvas, drawOverlay, inDragBand, mOf } from "./overlay.js"
 const P = G.problem;
 const params = new URLSearchParams(location.search);
 const TARGET_SRC = "assets/targets.mind";
+const SHEET_SRC = "assets/target.png";
+const SIZES = [1, 1.5, 2];
 
 const state = {
   a: P.a0,
-  layers: { reactions: true, sfd: false, bmd: false, defl: false },
-  mode: null,            // "ar" | "2d"
+  layers: { reactions: true, sfd: false, bmd: false },
+  beam: "original",                 // original | deflected | both
+  standUp: false,
+  size: 1,
+  mode: null,                       // ar | 3d | 2d
   dragging: false,
   frozen: false,
   tracking: false,
@@ -19,31 +26,36 @@ const state = {
 
 const $ = (id) => document.getElementById(id);
 const el = {
-  start: $("start"), stage: $("stage"), arBox: $("ar-container"), c2d: $("view2d"),
+  start: $("start"), stage: $("stage"), arBox: $("ar-container"), box3d: $("view3d-container"), c2d: $("view2d"),
   hint: $("hint"), status: $("status"), deflNote: $("defl-note"),
   a: $("v-a"), ra: $("v-ra"), rb: $("v-rb"), m: $("v-m"),
-  slider: $("load"), sliderOut: $("load-out"),
-  all: $("btn-all"), reset: $("btn-reset"), freeze: $("btn-freeze"), mode: $("btn-mode"),
+  slider: $("load"), sliderOut: $("load-out"), reset: $("btn-reset"),
+  all: $("btn-all"), stand: $("btn-stand"), size: $("btn-size"), freeze: $("btn-freeze"),
   msg: $("message"), msgTitle: $("msg-title"), msgText: $("msg-text"), msgPrimary: $("msg-primary"), msgSecondary: $("msg-secondary"),
+  views: document.querySelectorAll("[data-view]"), beams: document.querySelectorAll("[data-beam]"), layers: document.querySelectorAll("[data-layer]"),
 };
 
 const overlay = createOverlayCanvas();
 const sheetImg = new Image();
-sheetImg.src = "assets/target.png";
-let ar = null;             // AR session handle
-let view2d = null;         // 2D view geometry {scale, x0, y0}
+sheetImg.src = SHEET_SRC;
 let sol = solve(P.L, P.P, state.a);
+let fig = null;          // shared 3D figure (created the first time a 3D view opens)
+let view = null;         // active AR or 3D-model session
+let view2d = null;       // 2D layout
+let lostAt = -Infinity;
+let dragId = null;
 
 // ------------------------------------------------------------------ rendering
 let pending = false;
 function render() {
-  if (pending) return;
+  if (fig) fig.setState({ sol, layers: state.layers, beam: state.beam, standUp: state.standUp, size: state.size, dragging: state.dragging });
+  if (view && view.frame) view.frame(state.standUp, state.size);
+  if (state.mode !== "2d" || pending) return;
   pending = true;
   requestAnimationFrame(() => {
     pending = false;
-    drawOverlay(overlay, { sol, a0: P.a0, layers: state.layers, debug: state.debug, dragging: state.dragging });
-    if (state.mode === "ar" && ar) ar.refresh();
-    if (state.mode === "2d") draw2d();
+    drawOverlay(overlay, { sol, a0: P.a0, layers: state.layers, beam: state.beam, debug: state.debug, dragging: state.dragging });
+    draw2d();
   });
 }
 
@@ -60,26 +72,38 @@ function updateReadouts() {
 
 function setLoad(a) {
   const s = snapLoad(a, P);
-  if (Math.abs(s - state.a) < 1e-9 && sol) return;
+  if (Math.abs(s - state.a) < 1e-9) return;
   state.a = s;
   sol = solve(P.L, P.P, s);
   updateReadouts();
   render();
 }
 
-function syncLayerButtons() {
-  document.querySelectorAll("[data-layer]").forEach((b) => b.setAttribute("aria-pressed", String(state.layers[b.dataset.layer])));
-  const allOn = Object.values(state.layers).every(Boolean);
-  el.all.textContent = allOn ? "Hide all" : "Show all";
-  el.deflNote.hidden = !state.layers.defl;
+const allOn = () => Object.values(state.layers).every(Boolean) && state.beam === "both";
+
+function syncControls() {
+  el.layers.forEach((b) => b.setAttribute("aria-pressed", String(state.layers[b.dataset.layer])));
+  el.beams.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.beam === state.beam)));
+  el.views.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.view === state.mode)));
+  el.all.setAttribute("aria-pressed", String(allOn()));
+  el.all.querySelector("span").textContent = allOn() ? "Hide all" : "Show all";
+  el.stand.textContent = state.standUp ? "Lay flat" : "Stand up";
+  el.stand.setAttribute("aria-pressed", String(state.standUp));
+  el.size.textContent = `Size ${state.size}\u00D7`;
+  el.freeze.textContent = state.frozen ? "Resume" : "Freeze";
+  el.freeze.setAttribute("aria-pressed", String(state.frozen));
+  el.deflNote.hidden = state.beam === "original";
 }
 
 function setStatus() {
-  let t;
+  let t = "";
   if (state.mode === "2d") t = "Drag the red handle or use the slider to move the load.";
-  else if (state.frozen) t = "View frozen. Drag the load, then tap Resume tracking.";
-  else if (!state.tracking) t = "Point the camera at the whole problem sheet.";
-  else t = "Drag the red handle on the sheet. Freeze the view to drag more easily.";
+  else if (state.mode === "3d") t = "Drag the red handle to move the load. Drag anywhere else to turn the model.";
+  else if (state.mode === "ar") {
+    if (state.frozen) t = "View frozen. Drag the load, then tap Resume.";
+    else if (!state.tracking) t = "Point the camera at the whole problem sheet.";
+    else t = "Drag the red handle, or use the slider. Freeze makes dragging easier.";
+  }
   el.status.textContent = t;
   el.hint.hidden = !(state.mode === "ar" && !state.tracking && !state.frozen);
 }
@@ -87,12 +111,10 @@ function setStatus() {
 // ------------------------------------------------------------------ 2D view
 function layout2d() {
   const W = el.stage.clientWidth, H = el.stage.clientHeight;
-  const v = G.view2d;
-  const wmm = v.x1 - v.x0;
+  if (!W || !H) return;
+  const v = G.view2d, wmm = v.x1 - v.x0;
   let scale = W / wmm;
-  // Show as much of the question above the figure as the screen allows.
-  let yTop = Math.max(10, v.y1 - H / scale);
-  yTop = Math.min(yTop, v.y0);
+  let yTop = Math.min(Math.max(10, v.y1 - H / scale), v.y0);   // show as much of the question as fits
   if ((v.y1 - yTop) * scale > H) scale = H / (v.y1 - yTop);
   const cssW = wmm * scale, cssH = (v.y1 - yTop) * scale;
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
@@ -103,6 +125,7 @@ function layout2d() {
 
 function draw2d() {
   if (!view2d) layout2d();
+  if (!view2d) return;
   const { scale, x0, y0, dpr } = view2d;
   const ctx = el.c2d.getContext("2d");
   const k = scale * dpr;
@@ -114,110 +137,168 @@ function draw2d() {
   ctx.drawImage(overlay, 0, G.overlay.y0, G.pageW, G.overlay.y1 - G.overlay.y0);
 }
 
-function sheetPoint2d(ev) {
-  const r = el.c2d.getBoundingClientRect();
-  return { x: view2d.x0 + (ev.clientX - r.left) / view2d.scale, y: view2d.y0 + (ev.clientY - r.top) / view2d.scale };
-}
-
-// ------------------------------------------------------------------ dragging (both views)
-function toSheet(ev) {
-  if (state.mode === "2d") return sheetPoint2d(ev);
-  if (state.mode === "ar" && ar) return ar.toSheet(ev.clientX, ev.clientY);
+// ------------------------------------------------------------------ dragging the load (all views)
+// Returns page millimetres { xmm, ymm } or null. bounded = only the load band counts.
+function toSheet(ev, bounded) {
+  if (state.mode === "2d" && view2d) {
+    const r = el.c2d.getBoundingClientRect();
+    const xmm = view2d.x0 + (ev.clientX - r.left) / view2d.scale, ymm = view2d.y0 + (ev.clientY - r.top) / view2d.scale;
+    return bounded && !inDragBand(ymm) ? null : { xmm, ymm };
+  }
+  if (view) return view.toSheet(ev.clientX, ev.clientY, bounded);
   return null;
 }
+// Capture phase, so a drag on the load wins over turning the 3D model.
 el.stage.addEventListener("pointerdown", (ev) => {
-  const p = toSheet(ev);
-  if (!p || !inDragBand(p.y)) return;
-  state.dragging = true;
+  if (state.dragging) return;
+  const p = toSheet(ev, true);
+  if (!p) return;
+  ev.stopPropagation(); ev.preventDefault();
+  state.dragging = true; dragId = ev.pointerId;
   el.stage.setPointerCapture(ev.pointerId);
-  setLoad(mOf(p.x));
+  setLoad(mOf(p.xmm));
   render();
-});
+}, { capture: true });
 el.stage.addEventListener("pointermove", (ev) => {
-  if (!state.dragging) return;
-  const p = toSheet(ev);
-  if (p) setLoad(mOf(p.x));
-});
-const endDrag = () => { if (state.dragging) { state.dragging = false; render(); } };
-el.stage.addEventListener("pointerup", endDrag);
-el.stage.addEventListener("pointercancel", endDrag);
+  if (!state.dragging || ev.pointerId !== dragId) return;
+  ev.stopPropagation();
+  const p = toSheet(ev, false);
+  if (p) setLoad(mOf(p.xmm));
+}, { capture: true });
+const endDrag = (ev) => {
+  if (!state.dragging || ev.pointerId !== dragId) return;
+  state.dragging = false; dragId = null;
+  render();
+};
+el.stage.addEventListener("pointerup", endDrag, { capture: true });
+el.stage.addEventListener("pointercancel", endDrag, { capture: true });
 
 // ------------------------------------------------------------------ controls
 el.slider.min = P.aMin; el.slider.max = P.aMax; el.slider.step = P.step;
 el.slider.addEventListener("input", () => setLoad(parseFloat(el.slider.value)));
+el.reset.addEventListener("click", () => setLoad(P.a0));
 
-document.querySelectorAll("[data-layer]").forEach((b) => b.addEventListener("click", () => {
+el.layers.forEach((b) => b.addEventListener("click", () => {
   state.layers[b.dataset.layer] = !state.layers[b.dataset.layer];
-  syncLayerButtons(); render();
+  syncControls(); render();
+}));
+el.beams.forEach((b) => b.addEventListener("click", () => {
+  state.beam = b.dataset.beam;
+  syncControls(); render();
 }));
 el.all.addEventListener("click", () => {
-  const allOn = Object.values(state.layers).every(Boolean);
-  for (const k of Object.keys(state.layers)) state.layers[k] = !allOn;
-  syncLayerButtons(); render();
+  const on = !allOn();
+  for (const k of Object.keys(state.layers)) state.layers[k] = on;
+  state.beam = on ? "both" : "original";
+  syncControls(); render();
 });
-el.reset.addEventListener("click", () => setLoad(P.a0));
+el.stand.addEventListener("click", () => { state.standUp = !state.standUp; syncControls(); render(); });
+el.size.addEventListener("click", () => {
+  state.size = SIZES[(SIZES.indexOf(state.size) + 1) % SIZES.length];
+  syncControls(); render();
+});
 el.freeze.addEventListener("click", () => {
-  if (!ar) return;
+  if (!view || !view.setFrozen) return;
   state.frozen = !state.frozen;
-  ar.setFrozen(state.frozen);
-  el.freeze.textContent = state.frozen ? "Resume tracking" : "Freeze view";
-  el.freeze.setAttribute("aria-pressed", String(state.frozen));
-  setStatus();
+  view.setFrozen(state.frozen);
+  syncControls(); setStatus();
 });
-el.mode.addEventListener("click", () => (state.mode === "ar" ? enter2d() : enterAR()));
+el.views.forEach((b) => b.addEventListener("click", () => {
+  if (b.dataset.view === state.mode) return;
+  ({ ar: enterAR, "3d": enter3d, "2d": enter2d })[b.dataset.view]();
+}));
 
-// ------------------------------------------------------------------ modes
+// ------------------------------------------------------------------ views
+async function stopView() {
+  if (view) { const v = view; view = null; await v.stop(); }
+  state.frozen = false; state.tracking = false;
+}
+
+function showMode(mode) {
+  state.mode = mode;
+  document.body.dataset.mode = mode;
+  el.start.hidden = true;
+  el.arBox.hidden = mode !== "ar";
+  el.box3d.hidden = mode !== "3d";
+  el.c2d.hidden = mode !== "2d";
+  document.querySelectorAll(".only3d").forEach((e) => { e.hidden = mode === "2d"; });
+  el.freeze.hidden = mode !== "ar";
+  syncControls(); setStatus();
+}
+
+async function load3D() {
+  if (!fig) {
+    const { createFigure3D } = await import("./figure3d.js");
+    fig = createFigure3D();
+  }
+  return fig;
+}
+
 async function enter2d() {
-  if (ar) { const s = ar; ar = null; await s.stop(); }
-  state.mode = "2d"; state.frozen = false; state.tracking = false;
-  document.body.dataset.mode = "2d";
-  el.start.hidden = true; el.arBox.hidden = true; el.c2d.hidden = false; el.freeze.hidden = true;
-  el.mode.textContent = "AR camera";
-  layout2d(); setStatus(); render();
+  await stopView();
+  showMode("2d");
+  layout2d(); render();
+}
+
+async function enter3d() {
+  await stopView();
+  showMode("3d");
+  el.status.textContent = "Loading the 3D model\u2026";
+  try {
+    const f = await load3D();
+    const { start3DView } = await import("./view3d.js");
+    view = start3DView({ container: el.box3d, fig: f, sheetSrc: SHEET_SRC });
+    render(); f.playEntrance(); setStatus();
+  } catch (err) {
+    console.error(err);
+    el.box3d.replaceChildren(); view = null;
+    await enter2d();
+    showMessage("The 3D model could not load",
+      "Check your internet connection, then try again. The 2D sheet shows the same results.",
+      { primary: "Try again", onPrimary: enter3d });
+  }
 }
 
 async function enterAR() {
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
     return showMessage("Camera not available",
-      "This browser cannot open the camera from this page. Open the link in Chrome (Android) or Safari (iPhone), or use the 2D view.");
+      "This browser cannot open the camera from this page. Open the link in Chrome (Android) or Safari (iPhone), or use the 3D model.",
+      { primary: "Open 3D model", onPrimary: enter3d });
   }
   try {
     const head = await fetch(TARGET_SRC, { method: "HEAD", cache: "no-store" });
     if (!head.ok) throw new Error("missing");
   } catch {
     return showMessage("AR target not set up yet",
-      "The file assets/targets.mind is missing from the website. Compile assets/target.png with the MindAR target compiler and upload the result (see the README). The 2D view works in the meantime.");
+      "The file assets/targets.mind is missing from the website. Compile assets/target.png with the MindAR target compiler and upload the result (see the README). The 3D model works in the meantime.",
+      { primary: "Open 3D model", onPrimary: enter3d });
   }
 
-  state.mode = "ar"; state.tracking = false; state.frozen = false;
-  document.body.dataset.mode = "ar";
-  el.start.hidden = true; el.c2d.hidden = true; el.arBox.hidden = false; el.freeze.hidden = false;
-  el.freeze.textContent = "Freeze view"; el.freeze.setAttribute("aria-pressed", "false");
-  el.mode.textContent = "2D view";
+  await stopView();
+  showMode("ar");
   el.hint.textContent = "Starting camera\u2026"; el.hint.hidden = false;
   el.status.textContent = "Allow camera access when your browser asks.";
-
   try {
+    const f = await load3D();
     const { startAR } = await import("./ar.js");
-    ar = await startAR({
-      container: el.arBox, overlayCanvas: overlay, targetSrc: TARGET_SRC,
-      onFound: () => { state.tracking = true; setStatus(); },
-      onLost: () => { state.tracking = false; setStatus(); },
+    view = await startAR({
+      container: el.arBox, targetSrc: TARGET_SRC, fig: f,
+      onFound: () => { if (performance.now() - lostAt > 1500) f.playEntrance(); state.tracking = true; setStatus(); },
+      onLost: () => { lostAt = performance.now(); state.tracking = false; setStatus(); },
     });
     el.hint.textContent = "Point the camera at the whole problem sheet";
-    setStatus(); render();
+    render(); setStatus();
   } catch (err) {
     console.error(err);
-    el.arBox.replaceChildren();
-    ar = null;
+    el.arBox.replaceChildren(); view = null;
     await enter2d();
     showMessage("The camera could not start",
-      "Check that camera access is allowed for this site in your browser settings, then try again. You are now in the 2D view, which shows the same results.",
+      "Check that camera access is allowed for this site in your browser settings, then try again. The 3D model and 2D sheet work without the camera.",
       { primary: "Try again", onPrimary: enterAR });
   }
 }
 
-function showMessage(title, text, { primary = "Use 2D view", onPrimary = enter2d } = {}) {
+function showMessage(title, text, { primary = "Use 2D sheet", onPrimary = enter2d } = {}) {
   el.msgTitle.textContent = title; el.msgText.textContent = text;
   el.msgPrimary.textContent = primary;
   el.msgPrimary.onclick = () => { el.msg.close(); onPrimary(); };
@@ -226,13 +307,15 @@ function showMessage(title, text, { primary = "Use 2D view", onPrimary = enter2d
 }
 
 $("go-ar").addEventListener("click", enterAR);
+$("go-3d").addEventListener("click", enter3d);
 $("go-2d").addEventListener("click", enter2d);
 
-// Re-fit the 2D view whenever the stage changes size (rotation, readout text wrapping, etc.)
 new ResizeObserver(() => { if (state.mode === "2d") { layout2d(); render(); } }).observe(el.stage);
 sheetImg.addEventListener("load", () => render());
-document.fonts?.ready.then(() => render());
+document.fonts?.ready.then(() => { if (fig) fig.refreshLabels(); render(); });
 
 // ------------------------------------------------------------------ boot
-updateReadouts(); syncLayerButtons();
-if (params.get("mode") === "2d") enter2d();
+updateReadouts(); syncControls();
+const startMode = params.get("mode");
+if (startMode === "2d") enter2d();
+else if (startMode === "3d") enter3d();

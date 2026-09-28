@@ -32,7 +32,7 @@ export const mOf = (xmm) => (xmm - G.xA) / G.mmPerM;
 export const inDragBand = (ymm) => ymm >= O.y0 && ymm <= 165;
 
 export function drawOverlay(canvas, st) {
-  // st: { sol, a0, layers:{reactions,sfd,bmd,defl}, debug, dragging }
+  // st: { sol, a0, layers:{reactions,sfd,bmd}, beam: original|deflected|both, debug, dragging }
   const k = canvas.pxPerMM;
   const ctx = canvas.getContext("2d");
   const X = (mm) => mm * k;
@@ -132,16 +132,25 @@ export function drawOverlay(canvas, st) {
     text(`at x = ${fmt.m(sol.a)} m`, cx, peak + 10.0, 3.8, { align: "center", weight: 500 });
   }
 
-  // ---------- deflected shape (exaggerated)
-  if (layers.defl) {
-    const pts = [];
-    for (let i = 0; i <= 120; i++) { const x = (sol.L * i) / 120; pts.push([xOf(x), G.beamY + G.deflScale * sol.defl(x)]); }
-    line(pts, "white", 1.6);
-    line(pts, COLORS.defl, 0.8);
-    const xd = xOf(sol.xDmax), yd = G.beamY + G.deflScale * sol.dmax;
-    ctx.beginPath(); ctx.arc(X(xd), Y(yd), 1.0 * k, 0, Math.PI * 2); ctx.fillStyle = COLORS.defl; ctx.fill();
-    text(`\u03B4_{max} at x = ${fmt.m(sol.xDmax)} m`, xd, yd + 5.4, 3.9, { align: "center", color: COLORS.defl });
-    text("(exaggerated)", xd, yd + 9.6, 3.3, { align: "center", color: COLORS.defl, weight: 500 });
+  // ---------- beam shape: original (printed) / deflected / both
+  if (st.beam && st.beam !== "original") {
+    const N = 120, depth = 2 * G.beamHalf, ov = 3 / G.mmPerM, e = 1e-4;
+    const s0 = sol.defl(e) / e, sL = -sol.defl(sol.L - e) / e;      // end slopes, for the short overhangs
+    const d = (x) => (x < 0 ? s0 * x : x > sol.L ? sL * (x - sol.L) : sol.defl(x));
+    const yAt = (x) => G.beamY + G.deflScale * d(x);
+    const top = [], bot = [];
+    for (let i = 0; i <= N; i++) { const x = -ov + ((sol.L + 2 * ov) * i) / N; top.push([xOf(x), yAt(x) - depth / 2]); bot.push([xOf(x), yAt(x) + depth / 2]); }
+    if (st.beam === "deflected") {
+      // hide the printed (original) beam so only the deflected one shows
+      ctx.fillStyle = "rgba(255,255,255,0.96)";
+      ctx.fillRect(X(xA - 3.6), Y(G.beamY - G.beamHalf - 0.6), X(xB + 3.6) - X(xA - 3.6), Y(G.beamY + G.beamHalf + 0.6) - Y(G.beamY - G.beamHalf - 0.6));
+    }
+    const band = [...top, ...bot.reverse()];
+    poly(band, st.beam === "both" ? "rgba(107,63,160,0.28)" : "rgba(129,150,172,0.95)", COLORS.defl, 0.45);
+    const xd = xOf(sol.xDmax), yd = yAt(sol.xDmax) + depth / 2;
+    ctx.beginPath(); ctx.arc(X(xd), Y(yd + 1.2), 1.0 * k, 0, Math.PI * 2); ctx.fillStyle = COLORS.defl; ctx.fill();
+    text(`\u03B4_{max} at x = ${fmt.m(sol.xDmax)} m`, xd, yd + 6.6, 3.9, { align: "center", color: COLORS.defl });
+    text("(exaggerated)", xd, yd + 10.6, 3.3, { align: "center", color: COLORS.defl, weight: 500 });
   }
 
   // ---------- support reactions (arrow length proportional to magnitude)

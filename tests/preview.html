@@ -1,0 +1,118 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>html,body{margin:0;background:#cfd8df}canvas{display:block}</style></head>
+<body><canvas id="c"></canvas>
+<script type="module">
+import { G } from "../js/geometry.js";
+import { solve } from "../js/beam.js";
+import { buildScene, DIM } from "../js/scene3d.js";
+import { renderLabel, labelGeometry } from "../js/labels.js";
+
+const q = new URLSearchParams(location.search);
+const W = +(q.get("w") || 800), H = +(q.get("h") || 900);
+const a = +(q.get("a") || 1.5), beam = q.get("beam") || "original";
+const layers = { reactions: q.get("r") !== "0", sfd: q.get("sfd") === "1", bmd: q.get("bmd") === "1" };
+const theta = (+(q.get("theta") || 0)) * Math.PI / 180, size = +(q.get("size") || 1);
+const eye = (q.get("eye") || "0,-300,330").split(",").map(Number);
+const tgt = (q.get("tgt") || "0,-35,0").split(",").map(Number);
+const fov = +(q.get("fov") || 42);
+const sheetOn = q.get("sheet") !== "0";
+
+const cv = document.getElementById("c"); cv.width = W; cv.height = H;
+const gl = cv.getContext("webgl2", { antialias: true, premultipliedAlpha: false });
+
+// ---------- math
+const m4 = {
+  mul(a, b) { const o = new Float32Array(16); for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + j] * b[i * 4 + k]; o[i * 4 + j] = s; } return o; },
+  persp(f, asp, n, fa) { const t = 1 / Math.tan(f / 2); return new Float32Array([t / asp, 0, 0, 0, 0, t, 0, 0, 0, 0, (fa + n) / (n - fa), -1, 0, 0, (2 * fa * n) / (n - fa), 0]); },
+  look(e, c, up) {
+    const z = norm(sub(e, c)), x = norm(cross(up, z)), y = cross(z, x);
+    return new Float32Array([x[0], y[0], z[0], 0, x[1], y[1], z[1], 0, x[2], y[2], z[2], 0, -dot(x, e), -dot(y, e), -dot(z, e), 1]);
+  },
+  tr(x, y, z) { return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]); },
+  rx(t) { const c = Math.cos(t), s = Math.sin(t); return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]); },
+  sc(s) { return new Float32Array([s, 0, 0, 0, 0, s, 0, 0, 0, 0, s, 0, 0, 0, 0, 1]); },
+  app(m, p) { const x = p[0], y = p[1], z = p[2]; const w = m[3] * x + m[7] * y + m[11] * z + m[15];
+    return [(m[0] * x + m[4] * y + m[8] * z + m[12]) / w, (m[1] * x + m[5] * y + m[9] * z + m[13]) / w, (m[2] * x + m[6] * y + m[10] * z + m[14]) / w]; },
+};
+function sub(a, b) { return [a[0] - b[0], a[1] - b[1], a[2] - b[2]]; }
+function dot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+function cross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+function norm(v) { const l = Math.hypot(...v); return v.map((c) => c / l); }
+
+const P = m4.persp(fov * Math.PI / 180, W / H, 5, 6000);
+const V = m4.look(eye, tgt, [0, 0, 1]);
+const M = m4.mul(m4.tr(0, DIM.hingeY, theta ? 0.5 : 0), m4.mul(m4.rx(theta), m4.mul(m4.sc(size), m4.tr(0, -DIM.hingeY, 0))));
+const PV = m4.mul(P, V), PVM = m4.mul(PV, M);
+
+// ---------- shaders (vertex colours are linear, output is sRGB - same as three.js)
+function prog(vs, fs) { const p = gl.createProgram(); for (const [t, s] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) { const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh); if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw gl.getShaderInfoLog(sh); gl.attachShader(p, sh); } gl.linkProgram(p); return p; }
+const colP = prog(`#version 300 es
+in vec3 p; in vec3 c; uniform mat4 m; out vec3 vc; void main(){ vc=c; gl_Position=m*vec4(p,1.0); }`,
+`#version 300 es
+precision highp float; in vec3 vc; uniform float o; out vec4 f;
+vec3 enc(vec3 x){ return mix(x*12.92, 1.055*pow(x,vec3(1.0/2.4))-0.055, step(vec3(0.0031308),x)); }
+void main(){ f=vec4(enc(vc), o); }`);
+const texP = prog(`#version 300 es
+in vec3 p; in vec2 uv; uniform mat4 m; out vec2 vu; void main(){ vu=uv; gl_Position=m*vec4(p,1.0); }`,
+`#version 300 es
+precision highp float; in vec2 vu; uniform sampler2D t; uniform float o; out vec4 f; void main(){ vec4 c=texture(t,vu); f=vec4(c.rgb, c.a*o); }`);
+
+function drawColored(pos, col, idx, mvp, opacity) {
+  gl.useProgram(colP);
+  const P3 = new Float32Array(idx.length * 3), C3 = new Float32Array(idx.length * 3);
+  idx.forEach((k, i) => { for (let j = 0; j < 3; j++) { P3[i * 3 + j] = pos[k * 3 + j]; C3[i * 3 + j] = col[k * 3 + j]; } });
+  for (const [name, data] of [["p", P3], ["c", C3]]) { const bf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bf); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); const l = gl.getAttribLocation(colP, name); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, 3, gl.FLOAT, false, 0, 0); }
+  gl.uniformMatrix4fv(gl.getUniformLocation(colP, "m"), false, mvp); gl.uniform1f(gl.getUniformLocation(colP, "o"), opacity);
+  gl.drawArrays(gl.TRIANGLES, 0, idx.length);
+}
+function drawQuad(corners, tex, mvp, opacity) {
+  gl.useProgram(texP);
+  const [a, b, c, d] = corners; const P3 = new Float32Array([...a, ...b, ...c, ...a, ...c, ...d]); const UV = new Float32Array([0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0]);
+  for (const [name, data, n] of [["p", P3, 3], ["uv", UV, 2]]) { const bf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, bf); gl.bufferData(gl.ARRAY_BUFFER, data, gl.STATIC_DRAW); const l = gl.getAttribLocation(texP, name); gl.enableVertexAttribArray(l); gl.vertexAttribPointer(l, n, gl.FLOAT, false, 0, 0); }
+  gl.bindTexture(gl.TEXTURE_2D, tex); gl.uniformMatrix4fv(gl.getUniformLocation(texP, "m"), false, mvp); gl.uniform1f(gl.getUniformLocation(texP, "o"), opacity);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+}
+function texFrom(img) { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t); gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img); gl.generateMipmap(gl.TEXTURE_2D); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); return t; }
+
+async function run() {
+  const img = new Image(); img.src = "../assets/target.png"; await img.decode();
+  gl.viewport(0, 0, W, H); gl.clearColor(0.81, 0.85, 0.88, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  if (sheetOn) { const hw = G.pageW / 2, hh = G.targetH / 2; drawQuad([[-hw, -hh, 0], [hw, -hh, 0], [hw, hh, 0], [-hw, hh, 0]].map(p=>p), texFrom(img), PV, 1); }
+
+  if (theta > 0.05) {
+    const c = document.createElement("canvas"); c.width = 16; c.height = 128; const g2 = c.getContext("2d");
+    const gr = g2.createLinearGradient(0, 128, 0, 0);
+    gr.addColorStop(0, "rgba(10,20,30,0)"); gr.addColorStop(0.2, "rgba(10,20,30,0.55)"); gr.addColorStop(0.34, "rgba(10,20,30,0.3)"); gr.addColorStop(1, "rgba(10,20,30,0)");
+    g2.fillStyle = gr; g2.fillRect(0, 0, 16, 128);
+    const Lh = 40 * size, hw = 98 * size, y0 = DIM.hingeY - 0.2 * Lh, y1 = y0 + Lh;
+    drawQuad([[-hw, y0, 0.15], [hw, y0, 0.15], [hw, y1, 0.15], [-hw, y1, 0.15]], texFrom(c), PV, 0.9 * Math.sin(theta));
+  }
+  const sol = solve(G.problem.L, G.problem.P, a);
+  const S = buildScene({ sol, layers, beam, defl: beam === "original" ? 0 : 1, dragging: false });
+  const bs = [...S.batches.values()];
+  let tris = 0, bad = 0;
+  for (const b of bs) { tris += b.idx.length / 3; for (const v of b.pos) if (!Number.isFinite(v)) bad++; }
+  const opaque = bs.filter((b) => b.opacity >= 1), trans = bs.filter((b) => b.opacity < 1).sort((p, q) => p.order - q.order);
+  for (const b of opaque) drawColored(b.pos, b.col, b.idx, PVM, 1);
+  gl.depthMask(false);
+  for (const b of trans) drawColored(b.pos, b.col, b.idx, PVM, b.opacity);
+  // flat labels (in the figure plane)
+  for (const L of S.labels.filter((l) => l.flat)) {
+    const im = renderLabel(L); const g = labelGeometry(L, im);
+    const x0 = L.pos[0] - g.centerX * g.w, y0 = L.pos[1] - 0.5 * g.h, z = L.pos[2];
+    drawQuad([[x0, y0, z], [x0 + g.w, y0, z], [x0 + g.w, y0 + g.h, z], [x0, y0 + g.h, z]], texFrom(im.canvas), PVM, 1);
+  }
+  // sprites: camera-facing, drawn on top (depthTest off)
+  gl.disable(gl.DEPTH_TEST);
+  for (const L of S.labels.filter((l) => !l.flat)) {
+    const im = renderLabel(L); const g = labelGeometry(L, im);
+    const wc = m4.app(M, L.pos); const vc = m4.app(V, wc);
+    const w = g.w * size, h = g.h * size, ox = -g.centerX * w, oy = -0.5 * h;
+    const cs = [[ox, oy], [ox + w, oy], [ox + w, oy + h], [ox, oy + h]].map(([dx, dy]) => [vc[0] + dx, vc[1] + dy, vc[2]]);
+    drawQuad(cs, texFrom(im.canvas), P, 1);
+  }
+  document.title = JSON.stringify({ tris, bad, batches: bs.map((b) => b.key), labels: S.labels.length });
+}
+run().catch((e) => { document.title = "ERR " + e; });
+</script></body></html>
