@@ -9,7 +9,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@500;600;700&family=Barlow+Semi+Condensed:wght@500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="css/style.css">
-  <!-- AR libraries are only fetched when the AR camera is started. -->
+  <!-- 3D and AR libraries are only fetched when the AR camera or 3D model is opened. -->
   <script type="importmap">
   {
     "imports": {
@@ -48,62 +48,83 @@
 
   <main id="stage">
     <div id="ar-container" hidden></div>
+    <div id="view3d-container" hidden></div>
     <canvas id="view2d" hidden aria-label="Beam with the selected structural response drawn over the problem sheet"></canvas>
     <p id="hint" class="hint" hidden></p>
   </main>
 
   <section class="controls" aria-label="Controls">
+    <div class="views" role="group" aria-label="View">
+      <button type="button" data-view="ar" aria-pressed="false">AR camera</button>
+      <button type="button" data-view="3d" aria-pressed="false">3D model</button>
+      <button type="button" data-view="2d" aria-pressed="false">2D sheet</button>
+    </div>
+
     <div class="load-row">
-      <label for="load">Load position from A</label>
+      <label for="load">Load from A</label>
       <input type="range" id="load" min="0.1" max="3.9" step="0.1" value="1.5">
       <output id="load-out" for="load">1.5 m</output>
+      <button type="button" id="btn-reset" class="icon-btn" aria-label="Reset the load to 1.5 m" title="Reset load" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.2-5.3"/><path d="M4 4v4.5h4.5"/></svg>
+      </button>
     </div>
 
     <div class="layers" role="group" aria-label="Show on the beam">
       <button type="button" class="layer" data-layer="reactions" aria-pressed="true" style="--c: var(--reaction)">
         <svg viewBox="0 0 24 16" aria-hidden="true"><path d="M5 15V4M2.5 6.5 5 3l2.5 3.5M19 15V8M16.5 10.5 19 7l2.5 3.5"/></svg>
-        Reactions
+        <span>Reactions</span>
       </button>
-      <button type="button" class="layer" data-layer="sfd" aria-pressed="false" style="--c: var(--navy)">
+      <button type="button" class="layer" data-layer="sfd" aria-pressed="false" style="--c: var(--sfd)">
         <svg viewBox="0 0 24 16" aria-hidden="true"><path d="M1 8h22M2 8V3h8v10h12V8"/></svg>
-        SFD
+        <span>SFD</span>
       </button>
       <button type="button" class="layer" data-layer="bmd" aria-pressed="false" style="--c: var(--navy)">
         <svg viewBox="0 0 24 16" aria-hidden="true"><path d="M1 3h22M2 3l7 10 13-10"/></svg>
-        BMD
+        <span>BMD</span>
       </button>
-      <button type="button" class="layer" data-layer="defl" aria-pressed="false" style="--c: var(--defl)">
-        <svg viewBox="0 0 24 16" aria-hidden="true"><path d="M2 5c5 8 15 8 20 0" /><path d="M2 5h20" class="ghost"/></svg>
-        Deflection
+      <button type="button" class="layer" id="btn-all" aria-pressed="false" style="--c: var(--load)">
+        <svg viewBox="0 0 24 16" aria-hidden="true"><path d="M3 4h18M3 8h18M3 12h18"/></svg>
+        <span>Show all</span>
       </button>
     </div>
 
-    <div class="actions">
-      <button type="button" id="btn-all">Show all</button>
-      <button type="button" id="btn-reset" disabled>Reset load</button>
-      <button type="button" id="btn-freeze" aria-pressed="false" hidden>Freeze view</button>
-      <button type="button" id="btn-mode">AR camera</button>
+    <div class="beam-row" role="group" aria-label="Beam shape">
+      <span class="row-label">Beam</span>
+      <button type="button" data-beam="original" aria-pressed="true">Original</button>
+      <button type="button" data-beam="deflected" aria-pressed="false">Deflected</button>
+      <button type="button" data-beam="both" aria-pressed="false">Both</button>
+    </div>
+
+    <div class="actions only3d">
+      <button type="button" id="btn-stand" aria-pressed="false">Stand up</button>
+      <button type="button" id="btn-size">Size 1×</button>
+      <button type="button" id="btn-freeze" aria-pressed="false" hidden>Freeze</button>
     </div>
   </section>
 
   <section id="start" class="start">
     <div class="start-inner">
-      <svg class="start-figure" viewBox="0 0 320 110" aria-hidden="true">
-        <path class="load" d="M118 8v44"/><path class="load-head" d="M112 44l6 12 6-12z"/>
-        <rect class="beam" x="34" y="57" width="252" height="9"/>
-        <path class="sup" d="M46 66l-11 18h22zM274 66l-11 16h22z"/>
-        <circle class="sup" cx="268" cy="86" r="3"/><circle class="sup" cx="280" cy="86" r="3"/>
-        <path class="gnd" d="M28 90h36M256 90h36M32 90l-5 7M40 90l-5 7M48 90l-5 7M56 90l-5 7M64 90l-5 7M260 90l-5 7M268 90l-5 7M276 90l-5 7M284 90l-5 7M292 90l-5 7"/>
-        <path class="defl" d="M46 62C90 84 140 86 274 62"/>
+      <svg class="start-figure" viewBox="0 0 320 120" aria-hidden="true">
+        <defs>
+          <linearGradient id="steel" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#A9B9C9"/><stop offset="1" stop-color="#6E849A"/></linearGradient>
+        </defs>
+        <path class="load" d="M122 6v40"/><path class="load-head" d="M115 40l7 13 7-13z"/><circle class="load-head" cx="122" cy="8" r="6"/>
+        <path class="ghost" d="M34 56h252v10H34z"/>
+        <path class="beam" d="M34 56 C 100 70 150 72 286 56 L 286 66 C 150 82 100 80 34 66 Z"/>
+        <path class="sup" d="M46 66l-11 18h22zM274 64l-11 16h22z"/>
+        <circle class="pin" cx="268" cy="85" r="3"/><circle class="pin" cx="280" cy="85" r="3"/>
+        <path class="gnd" d="M30 88h32M258 88h32"/>
+        <path class="react" d="M46 112V96M40.5 101 46 94l5.5 7M274 112V100M268.5 105 274 98l5.5 7"/>
       </svg>
       <p class="start-module">CIVL6044 Structural Mechanics</p>
       <h1>Simply supported beam</h1>
-      <p>Point your phone at the printed problem sheet to see the support reactions, shear force, bending moment and deflected shape drawn on the beam. Drag the load and watch them change.</p>
+      <p>See the support reactions, shear force, bending moment and deflected shape of the beam on your problem sheet. Drag the load and watch them change, then stand the model up to look at it in 3D.</p>
       <div class="start-actions">
         <button type="button" id="go-ar" class="primary">Start AR camera</button>
-        <button type="button" id="go-2d">Use 2D view</button>
+        <button type="button" id="go-3d">Open 3D model</button>
+        <button type="button" id="go-2d" class="quiet">Open 2D sheet</button>
       </div>
-      <p class="fine">The camera image is processed on your phone only. Nothing is recorded or uploaded.</p>
+      <p class="fine">The AR camera needs the printed sheet. The 3D model and 2D sheet work anywhere. The camera image is processed on your phone only; nothing is recorded or uploaded.</p>
     </div>
   </section>
 
